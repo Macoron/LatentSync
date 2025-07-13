@@ -6,6 +6,8 @@ import os
 import shutil
 from typing import Callable, List, Optional, Union
 import subprocess
+from tools.perf_logger import exec_time_logger
+import time
 
 import numpy as np
 import torch
@@ -337,10 +339,14 @@ class LipsyncPipeline(DiffusionPipeline):
         check_ffmpeg_installed()
 
         # 0. Define call parameters
+        start = time.perf_counter()
+
         device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
         self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
+
+        exec_time_logger.info(f"Define call parameters {time.perf_counter() - start:.4f} seconds")
 
         # 1. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -361,19 +367,29 @@ class LipsyncPipeline(DiffusionPipeline):
         # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        start = time.perf_counter()
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
+        exec_time_logger.info(f"Whisper features + chunks {time.perf_counter() - start:.4f} seconds")
 
+        start = time.perf_counter()
         audio_samples = read_audio(audio_path)
-        video_frames = read_video(video_path, use_decord=False)
+        exec_time_logger.info(f"Read audio {time.perf_counter() - start:.4f} seconds")
 
+        start = time.perf_counter()
+        video_frames = read_video(video_path, use_decord=False)
+        exec_time_logger.info(f"Read video {time.perf_counter() - start:.4f} seconds")
+
+        start = time.perf_counter()
         video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        exec_time_logger.info(f"Loop video (affine_transform_video) {time.perf_counter() - start:.4f} seconds")
 
         synced_video_frames = []
 
         num_channels_latents = self.vae.config.latent_channels
 
         # Prepare latent variables
+        start = time.perf_counter()
         all_latents = self.prepare_latents(
             len(whisper_chunks),
             num_channels_latents,
@@ -383,9 +399,14 @@ class LipsyncPipeline(DiffusionPipeline):
             device,
             generator,
         )
+        exec_time_logger.info(f"Prepare latent variables {time.perf_counter() - start:.4f} seconds")
 
+        loop_preprocess_acm = 0
+        diffusion_step_acm = 0
+        decoder_acm = 0
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+            start = time.perf_counter()
             if self.unet.add_audio_layer:
                 audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
@@ -396,6 +417,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 audio_embeds = None
             inference_faces = faces[i * num_frames : (i + 1) * num_frames]
             latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
+
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
                 inference_faces, affine_transform=False
             )
@@ -421,7 +443,11 @@ class LipsyncPipeline(DiffusionPipeline):
                 do_classifier_free_guidance,
             )
 
+            loop_preprocess_acm += time.perf_counter() - start
+
             # 9. Denoising loop
+            start = time.perf_counter()
+
             num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for j, t in enumerate(timesteps):
@@ -450,14 +476,27 @@ class LipsyncPipeline(DiffusionPipeline):
                         if callback is not None and j % callback_steps == 0:
                             callback(j, t, latents)
 
+            diffusion_step_acm += time.perf_counter() - start
+
             # Recover the pixel values
+            start = time.perf_counter()
             decoded_latents = self.decode_latents(latents)
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
             synced_video_frames.append(decoded_latents)
 
+            decoder_acm += time.perf_counter() - start
+
+        exec_time_logger.info(f"Whisper chunks: {len(whisper_chunks)}, number of frames: {num_frames}, number inference: {num_inferences}")
+        exec_time_logger.info(f"Total diffusion inference {loop_preprocess_acm + diffusion_step_acm + decoder_acm:.4f} seconds")
+        exec_time_logger.info(f"Avg loop preprocess {loop_preprocess_acm / num_inference_steps:.4f} seconds")
+        exec_time_logger.info(f"Avg diff process {diffusion_step_acm / num_inference_steps:.4f} seconds")
+        exec_time_logger.info(f"Avg decoder step {decoder_acm / num_inference_steps:.4f} seconds")
+
+        start = time.perf_counter()
         synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+        exec_time_logger.info(f"Restore video {time.perf_counter() - start:.4f} seconds")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
@@ -469,9 +508,15 @@ class LipsyncPipeline(DiffusionPipeline):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
 
+        start = time.perf_counter()
         write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
+        exec_time_logger.info(f"Temp video {time.perf_counter() - start:.4f} seconds")
 
+        start = time.perf_counter()
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
+        exec_time_logger.info(f"Temp audio {time.perf_counter() - start:.4f} seconds")
 
+        start = time.perf_counter()
         command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
         subprocess.run(command, shell=True)
+        exec_time_logger.info(f"Final ffmpeg encoding {time.perf_counter() - start:.4f} seconds")
