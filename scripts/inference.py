@@ -22,17 +22,19 @@ from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
 from DeepCache import DeepCacheSDHelper
-
+from tools.perf_logger import exec_time_logger
+import time
 
 def main(config, args):
+    start = time.perf_counter()
+    
     if not os.path.exists(args.video_path):
         raise RuntimeError(f"Video path '{args.video_path}' not found")
     if not os.path.exists(args.audio_path):
         raise RuntimeError(f"Audio path '{args.audio_path}' not found")
 
-    # Check if the GPU supports float16
-    is_fp16_supported = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
-    dtype = torch.float16 if is_fp16_supported else torch.float32
+    # Force bfloat16 (assuming supported GPU)
+    dtype = torch.bfloat16
 
     print(f"Input video path: {args.video_path}")
     print(f"Input audio path: {args.audio_path}")
@@ -57,14 +59,14 @@ def main(config, args):
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
     vae.config.scaling_factor = 0.18215
     vae.config.shift_factor = 0
+    vae = torch.compile(vae.to("cuda"))
 
     unet, _ = UNet3DConditionModel.from_pretrained(
         OmegaConf.to_container(config.model),
         args.inference_ckpt_path,
         device="cpu",
     )
-
-    unet = unet.to(dtype=dtype)
+    unet = unet.to("cuda", dtype=dtype)
 
     pipeline = LipsyncPipeline(
         vae=vae,
@@ -72,6 +74,7 @@ def main(config, args):
         unet=unet,
         scheduler=scheduler,
     ).to("cuda")
+    pipeline.enable_xformers_memory_efficient_attention()
 
     # use DeepCache
     if args.enable_deepcache:
@@ -85,20 +88,23 @@ def main(config, args):
         torch.seed()
 
     print(f"Initial seed: {torch.initial_seed()}")
+    exec_time_logger.info(f"Before pipeline start {time.perf_counter() - start:.4f} seconds")
+    
+    with torch.inference_mode():
+        pipeline(
+            video_path=args.video_path,
+            audio_path=args.audio_path,
+            video_out_path=args.video_out_path,
+            num_frames=config.data.num_frames,
+            num_inference_steps=args.inference_steps,
+            guidance_scale=args.guidance_scale,
+            weight_dtype=dtype,
+            width=config.data.resolution,
+            height=config.data.resolution,
+            mask_image_path=config.data.mask_image_path,
+            temp_dir=args.temp_dir,
+        )
 
-    pipeline(
-        video_path=args.video_path,
-        audio_path=args.audio_path,
-        video_out_path=args.video_out_path,
-        num_frames=config.data.num_frames,
-        num_inference_steps=args.inference_steps,
-        guidance_scale=args.guidance_scale,
-        weight_dtype=dtype,
-        width=config.data.resolution,
-        height=config.data.resolution,
-        mask_image_path=config.data.mask_image_path,
-        temp_dir=args.temp_dir,
-    )
 
 
 if __name__ == "__main__":
@@ -117,4 +123,6 @@ if __name__ == "__main__":
 
     config = OmegaConf.load(args.unet_config_path)
 
+    start = time.perf_counter()
     main(config, args)
+    exec_time_logger.info(f"Total time {time.perf_counter() - start:.4f} seconds")
