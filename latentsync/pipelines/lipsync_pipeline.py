@@ -450,6 +450,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
             num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
             with self.progress_bar(total=num_inference_steps) as progress_bar:
+                self.scheduler.set_timesteps(num_inference_steps, device=device)
                 for j, t in enumerate(timesteps):
                     # expand the latents if we are doing classifier free guidance
                     unet_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents

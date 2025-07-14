@@ -16,7 +16,7 @@ import argparse
 import os
 from omegaconf import OmegaConf
 import torch
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DPMSolverMultistepScheduler 
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
@@ -40,7 +40,7 @@ def main(config, args):
     print(f"Input audio path: {args.audio_path}")
     print(f"Loaded checkpoint path: {args.inference_ckpt_path}")
 
-    scheduler = DDIMScheduler.from_pretrained("configs")
+    scheduler = DPMSolverMultistepScheduler .from_pretrained("configs")
 
     if config.model.cross_attention_dim == 768:
         whisper_model_path = "checkpoints/whisper/small.pt"
