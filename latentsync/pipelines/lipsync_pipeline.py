@@ -517,6 +517,6 @@ class LipsyncPipeline(DiffusionPipeline):
         exec_time_logger.info(f"Temp audio {time.perf_counter() - start:.4f} seconds")
 
         start = time.perf_counter()
-        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v copy -c:a aac -strict experimental -map 0:v:0 -map 1:a:0 {video_out_path}"
         subprocess.run(command, shell=True)
         exec_time_logger.info(f"Final ffmpeg encoding {time.perf_counter() - start:.4f} seconds")
