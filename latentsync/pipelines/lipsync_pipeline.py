@@ -8,11 +8,15 @@ from typing import Callable, List, Optional, Union
 import subprocess
 from tools.perf_logger import exec_time_logger
 import time
+from py_real_esrgan.model import RealESRGAN
+from PIL import Image
 
 import numpy as np
 import torch
 import torchvision
 from torchvision import transforms
+from torchvision.transforms.functional import pil_to_tensor, to_pil_image
+import torchvision.utils as vutils
 
 from packaging import version
 
@@ -60,6 +64,9 @@ class LipsyncPipeline(DiffusionPipeline):
         ],
     ):
         super().__init__()
+        
+        self.real_ersgan = RealESRGAN(vae.device, scale=2)
+        self.real_ersgan.load_weights('checkpoints/RealESRGAN_x2.pth')
 
         if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
             deprecation_message = (
@@ -144,6 +151,21 @@ class LipsyncPipeline(DiffusionPipeline):
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
         decoded_latents = self.vae.decode(latents).sample
         return decoded_latents
+
+    def upscale(self, image):
+        pil_image = to_pil_image((image  / 2 + 0.5).clamp(0, 1).to("cpu", dtype=torch.float16))
+        new_imate = self.real_ersgan.predict(pil_image)                            
+        ret = pil_to_tensor(new_imate).to(image.device, dtype=image.dtype)
+        ret = (ret / 255 - 0.5) * 2
+        return ret
+
+    @staticmethod
+    def save_temp_img(pixel_values, path="batch_grid_preview.png"):
+        grid = vutils.make_grid(pixel_values, nrow=4)
+        grid = (grid / 2 + 0.5).clamp(0, 1) * 255
+        ndarr = grid.byte().byte().permute(1, 2, 0).cpu().numpy()
+        Image.fromarray(ndarr).save(path)
+
 
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -266,6 +288,7 @@ class LipsyncPipeline(DiffusionPipeline):
         return faces, boxes, affine_matrices
 
     def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list):
+        print(faces.shape)
         video_frames = video_frames[: len(faces)]
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
@@ -485,8 +508,14 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
-            synced_video_frames.append(decoded_latents)
-
+                        
+            upscale_latents = []
+            for i in tqdm.tqdm(range(len(decoded_latents)), desc="Upscale"):
+                upscale_latent = self.upscale(decoded_latents[i])
+                upscale_latents.append(upscale_latent)
+            upscale_latents = torch.stack(upscale_latents)
+            
+            synced_video_frames.append(upscale_latents)
             decoder_acm += time.perf_counter() - start
 
         exec_time_logger.info(f"Whisper chunks: {len(whisper_chunks)}, number of frames: {num_frames}, number inference: {num_inferences}")
